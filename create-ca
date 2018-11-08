@@ -1,0 +1,243 @@
+#!/usr/bin/env python
+
+# Copyright 2017-2019 Fizyr B.V. - https://fizyr.com
+#
+# Redistribution and use in source and binary forms, with or without modification,
+# are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its contributors
+#    may be used to endorse or promote products derived from this software without
+#    specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+# ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+# ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+import os
+import sys
+from pathlib import Path
+
+from argparse import ArgumentParser
+from datetime import datetime, timedelta
+import subprocess
+
+from cryptography import x509
+
+from typing import List, Optional
+
+from message import msg, msg2, error
+
+import util
+import cert_tools
+
+def parseArguments():
+	parser = ArgumentParser(description='Create new root CA key and certificate.')
+	parser.add_argument('CA_DIR',                              help='Root directory for the CA files.')
+	parser.add_argument('--csr',          action='store_true', help='Create a CSR to be signed by the parent CA.')
+	parser.add_argument('--self-signed',  action='store_true', help='Create a self signed certificate, useful for a root CA.')
+	parser.add_argument('--import-cert',                       help='Import an existing certificate as CA cert.')
+	parser.add_argument('--days',            type=int,         help='The validity period of the self signed certificate in days, starting today.')
+	parser.add_argument('--max-path-length', type=int,         help='The maximum path of intermediate CA\'s following the newly created one.')
+	return parser.parse_args()
+
+
+def create_csr(root: Path, dn: x509.Name, dns_name, max_path_length: Optional[int], now: datetime) -> int:
+	key_file = root / 'ca-key' / '{}-{:%Y-%m-%d-%H-%M-%S}.key.pem'.format(dns_name, now)
+	key_link = root / 'ca.key.pem'
+
+	csr_file = root / 'ca-csr' / '{}-{:%Y-%m-%d-%H-%M-%S}.csr.pem'.format(dns_name, now)
+	csr_link = root / 'ca.csr.pem'
+
+	files        = [key_file, csr_file]
+	links        = [key_link, csr_link]
+	public_dirs  = [root / 'signed', csr_file.parent]
+	private_dirs = [key_file.parent]
+
+	# Make sure the files don't exist yet.
+	for file in files:
+		if file.exists():
+			error('File already exists: {}', file)
+			return 1
+
+	# Make sure the symlinks are non-existing or indeed symlinks.
+	for link in links:
+		if link.exists() and not link.is_symlink():
+			error('File exists but it not a symlink: {}', link)
+			return 1
+
+	# Create all public directories.
+	for dir in public_dirs:
+		os.makedirs(dir, exist_ok=True)
+
+	# Create private directories with modified umask.
+	umask = util.or_umask(0o077)
+	for dir in private_dirs:
+		os.makedirs(dir, exist_ok=True)
+	os.umask(umask)
+
+	# Generate key with modified umask.
+	msg('Generating key pair: {}', key_file)
+	umask = util.or_umask(0o277)
+	key = cert_tools.generate_rsa_key(key_file)
+	os.umask(umask)
+
+	# Create a CSR for the parent CA to sign.
+	msg('Making CSR: {}', csr_file)
+	cert_tools.make_csr(
+		csr_file,
+		key        = key,
+		name       = dn,
+		extensions = cert_tools.ca_extensions(dns_name, max_path_length),
+	)
+
+	# Create/update all the symlinks.
+	for file, link in zip(files, links):
+		util.force_relative_symlink(file, link);
+
+	return 0
+
+
+def create_self_signed(root: Path, dn: x509.Name, dns_name: str, max_path_length: Optional[int], days: int, now: datetime) -> int:
+	key_file = root / 'ca-key' / '{}-{:%Y-%m-%d-%H-%M-%S}.key.pem'.format(dns_name, now)
+	key_link = root / 'ca.key.pem'
+
+	cert_file = root / 'ca-cert' / '{}-{:%Y-%m-%d-%H-%M-%S}.csr.pem'.format(dns_name, now)
+	cert_link = root / 'ca.cert.pem'
+
+	files        = [key_file, cert_file]
+	links        = [key_link, cert_link]
+	public_dirs  = [root / 'signed', cert_file.parent]
+	private_dirs = [key_file.parent]
+
+	# Make sure the files don't exist yet.
+	for file in files:
+		if file.exists():
+			error('File already exists: {}', file)
+			return 1
+
+	# Make sure the symlinks are non-existing or indeed symlinks.
+	for link in links:
+		if link.exists() and not link.is_symlink():
+			error('File exists but it not a symlink: {}', link)
+			return 1
+
+	# Create all public directories.
+	for dir in public_dirs:
+		os.makedirs(dir, exist_ok=True)
+
+	# Create private directories with modified umask.
+	umask = util.or_umask(0o077)
+	for dir in private_dirs:
+		os.makedirs(dir, exist_ok=True)
+	os.umask(umask)
+
+	# Generate key with modified umask.
+	msg('Generating key pair: {}', key_file)
+	umask = util.or_umask(0o277)
+	key = cert_tools.generate_rsa_key(key_file)
+	os.umask(umask)
+
+	# Create and/or bump serial number.
+	serial = cert_tools.bump_serial(root / 'serial')
+
+	# Create self signed certificate.
+	msg('Making self signed certificate: {}', cert_file)
+	cert_tools.make_self_signed_cert(
+		cert_file,
+		key        = key,
+		name       = dn,
+		serial     = serial,
+		extensions = cert_tools.ca_extensions(dns_name, max_path_length),
+		days       = days,
+		now        = now,
+	)
+
+	# Create/update all the symlinks.
+	for file, link in zip(files, links):
+		util.force_relative_symlink(file, link);
+
+	return 0
+
+
+def import_certificate(root: Path, cert_in: Path):
+	cert_file = root / 'ca-cert' / cert_in.name
+	cert_link = root / 'ca.cert.pem'
+
+	files        = [cert_file]
+	links        = [cert_link]
+	public_dirs  = [root / 'signed', cert_file.parent]
+
+	# Make sure the files don't exist yet.
+	for file in files:
+		if file.exists():
+			error('File already exists: {}', file)
+			return 1
+
+	# Make sure the symlinks are non-existing or indeed symlinks.
+	for link in links:
+		if link.exists() and not link.is_symlink():
+			error('File exists but it not a symlink: {}', link)
+			return 1
+
+	# Create all public directories.
+	for dir in public_dirs:
+		os.makedirs(dir, exist_ok=True)
+
+	# Copy the certificate.
+	util.write_file(cert_file, util.read_file(cert_in))
+
+	# Create/update all the symlinks.
+	for file, link in zip(files, links):
+		util.force_relative_symlink(file, link);
+
+	return 0
+
+
+def count_bools(*args) -> int:
+	total = 0
+	for arg in args:
+		if arg: total += 1
+	return total
+
+
+def main():
+	now  = datetime.now().astimezone()
+	args = parseArguments()
+	root = Path(args.CA_DIR)
+
+	dn  = cert_tools.parse_dn(util.read_file(root / 'dirname').decode('utf8'))
+	dns = util.read_file(root / 'domain').decode('utf8').strip()
+
+	if count_bools(args.csr, args.self_signed, args.import_cert is not None) != 1:
+		error('You must choose exactly one of --csr, --self-signed and --import-cert')
+		return 1
+
+	if args.csr:
+		return create_csr(root, dn, dns, args.max_path_length, now)
+	elif args.self_signed:
+		if args.days is None:
+			error('The options --days is required when using --self-signed')
+			return 1
+		return create_self_signed(root, dn, dns, args.max_path_length, args.days, now)
+	elif args.import_cert is not None:
+		return import_certificate(root, Path(args.import_cert))
+
+	return 0
+
+
+if __name__ == '__main__':
+	sys.exit(main())

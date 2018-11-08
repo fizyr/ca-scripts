@@ -1,0 +1,151 @@
+#!/usr/bin/env python
+
+# Copyright 2017-2019 Fizyr B.V. - https://fizyr.com
+#
+# Redistribution and use in source and binary forms, with or without modification,
+# are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its contributors
+#    may be used to endorse or promote products derived from this software without
+#    specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+# ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+# ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+import sys
+from pathlib import Path
+
+from argparse import ArgumentParser
+from datetime import datetime, timedelta
+from typing import List
+
+from message import msg, msg2, error
+
+import cert_tools
+import util
+
+
+def parseArguments():
+	parser = ArgumentParser(description='Sign a certificate.')
+	parser.add_argument('CA_DIR',                           help='Root directory for the CA files.')
+	parser.add_argument('CSR',                              help='The CSR to sign.')
+	parser.add_argument('--out',                            help='Where to store the signed certificate (defaults to basename of CSR).')
+	parser.add_argument('--ca',    action='store_true',     help='Sign the certificate for use as an intermediate CA.')
+	parser.add_argument('--days',  required=True, type=int, help='The validity period for the signed certificate in days, starting today.')
+	parser.add_argument('--max-path-length',      type=int, help='The maximum number of intermediate CA\'s to form a valid chain. Only used if --ca is given.')
+	return parser.parse_args()
+
+
+def main():
+	now        = datetime.now().astimezone()
+	args       = parseArguments()
+	root       = Path(args.CA_DIR)
+	csr_in     = Path(args.CSR)
+
+	if args.out:
+		cert_out = Path(args.out)
+	else:
+		cert_out = Path(util.remove_suffix(util.remove_suffix(csr_in.resolve().name, '.pem'), '.csr') + '.cert.pem')
+
+	if cert_out.exists():
+		error('File already exists: {}', cert_out)
+		return 1
+
+	chain   = util.read_file(root / 'ca.cert.pem')
+	ca_cert = cert_tools.load_first_certificate(chain)
+	ca_key  = cert_tools.load_key(root / 'ca.key.pem')
+	csr     = cert_tools.load_csr(csr_in)
+
+	if ca_cert is None:
+		error('No certificate found in {}', root / 'ca.cert.pem')
+		return 1
+
+	if not csr.is_signature_valid:
+		error('CSR signature is invalid')
+		return 1
+
+	issuer  = ca_cert.subject
+	subject = csr.subject
+
+	if subject.rdns[1:] != issuer.rdns:
+		error('The requested subject name is not a direct subtree of the issuer name.')
+		msg2('Issuer:  {}', str(cert_tools.format_name(issuer)))
+		msg2('Subject: {}', str(cert_tools.format_name(subject)))
+		return 1
+
+	issuer_dns_name  = cert_tools.get_first_dns_name(cert_tools.get_subject_alt_names(ca_cert))
+	subject_dns_name = cert_tools.get_first_dns_name(cert_tools.get_subject_alt_names(csr))
+
+	if issuer_dns_name is None:
+		error('CA certificate has no DNS alternative name')
+		return 1
+
+	if subject_dns_name is None:
+		error('CSR has no DNS alternative name')
+		return 1
+
+	issuer_dns_name  = issuer_dns_name.value
+	subject_dns_name = subject_dns_name.value
+
+	if subject_dns_name.partition('.')[2] != issuer_dns_name:
+		error('Subject domain is not a direct subdomain of issuer domain.')
+		msg2('Issuer domain:         {}', repr(issuer_dns_name))
+		msg2('Subject domain:        {}', repr(subject_dns_name))
+		return 1
+
+	msg('Signing certificate: {}', cert_out)
+	msg2('Issuer DNS name: {}', issuer_dns_name)
+	msg2('Subject DNS name: {}', subject_dns_name)
+
+	is_ca_csr = cert_tools.get_basic_ca_constraint(csr)
+	if is_ca_csr is None:
+		error('CSR does not have a BasicConstraints extensions.')
+		return 1
+	elif is_ca_csr and not args.ca:
+		error('CSR has CA bit set but --ca is not given.')
+		return 1
+	elif not is_ca_csr and args.ca:
+		error('CSR does have CA bit set but --ca is given.')
+		return 1
+
+	if is_ca_csr:
+		extensions = cert_tools.ca_extensions(subject_dns_name, args.max_path_length)
+	else:
+		extensions = cert_tools.client_extensions(subject_dns_name)
+
+	serial = cert_tools.bump_serial(root / 'serial')
+
+	cert_tools.sign_csr(
+		cert_out,
+		chain      = chain,
+		csr        = csr,
+		ca_key     = ca_key,
+		ca_cert    = ca_cert,
+		name       = subject,
+		serial     = serial,
+		extensions = extensions,
+		days       = args.days,
+		now        = now,
+	)
+
+	return 0
+
+
+if __name__ == '__main__':
+	sys.exit(main())
