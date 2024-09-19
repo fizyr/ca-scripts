@@ -177,7 +177,7 @@ def ca_extensions(dns_name: str, max_path_length: Optional[int]) -> List[Tuple[x
 		(x509.BasicConstraints(True, max_path_length), True),
 		(x509.KeyUsage(False, False, False, False, False, True, True, False, False), True),
 		(x509.SubjectAlternativeName([x509.DNSName(dns_name)]), True),
-		(x509.NameConstraints([x509.DNSName('.' + dns_name)], []), True),
+		(x509.NameConstraints([x509.DNSName('.' + dns_name)], None), True),
 	]
 
 
