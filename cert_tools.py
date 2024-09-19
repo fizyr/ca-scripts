@@ -103,7 +103,7 @@ def parse_dn(value: str) -> x509.Name:
 	return x509.Name(map(lambda x: x509.RelativeDistinguishedName([parse_name_attribute(x)]), value.split(',')))
 
 
-def format_attribute(attrib: x509.NameAttribute):
+def format_attribute(attrib: x509.NameAttribute) -> str:
 	key = name_oid_to_key(attrib.oid)
 	if not key:
 		raise ValueError('unknown name attribute: {}'.format(attrib))
@@ -153,13 +153,13 @@ def get_first_dns_name(names: List[x509.GeneralName]) -> Optional[x509.DNSName]:
 		return None
 
 
-def read_serial(file: Path) -> int:
-	with open(file, 'r') as file:
+def read_serial(path: Path) -> int:
+	with open(path, 'r') as file:
 		return int(file.read(), 16)
 
 
-def write_serial(file: Path, value: int):
-	with open(file, 'w') as file:
+def write_serial(path: Path, value: int):
+	with open(path, 'w') as file:
 		file.write(hex(value))
 
 
@@ -196,24 +196,9 @@ def add_extensions(object, extensions: Iterable[Tuple[x509.Extension, bool]]):
 	return object;
 
 
-def replace_name_attribute(name: x509.Name, oid: NameOID, new_value: str) -> x509.Name:
-	new_attribs = []
-	replaced    = False
-	for attrib in original:
-		if not replaced and attrib.oid == oid:
-			new_attribs.append(x509.NameAttribute(oid, new_value))
-			replaced = True
-		else:
-			new_attribs.append(attrib)
-			break
-	return x509.Name(new_attribs)
-
 def prefix_name(name: x509.Name, oid: NameOID, value: str) -> x509.Name:
 	new_rdn = x509.RelativeDistinguishedName([x509.NameAttribute(oid, value)])
 	return x509.Name([new_rdn] + name.rdns)
-
-def replace_common_name(name: x509, new_value: str) -> x509.Name:
-	replace_name_attribute(name, NameOID.COMMON_NAME, new_value)
 
 
 def generate_rsa_key(file: Path, bits: int = 4096) -> rsa.RSAPrivateKey:
@@ -232,8 +217,8 @@ def generate_rsa_key(file: Path, bits: int = 4096) -> rsa.RSAPrivateKey:
 	return key
 
 
-def load_key(file: Path):
-	with open(file, 'rb') as file:
+def load_key(path: Path):
+	with open(path, 'rb') as file:
 		return serialization.load_pem_private_key(file.read(), password=None, backend=crypto_backend)
 
 
@@ -276,9 +261,9 @@ def sign_csr(
 
 	cert = cert.sign(ca_key, hashes.SHA512(), crypto_backend)
 
-	with open(file, 'wb') as file:
-		file.write(cert.public_bytes(serialization.Encoding.PEM))
-		file.write(chain)
+	with open(file, 'wb') as f:
+		f.write(cert.public_bytes(serialization.Encoding.PEM))
+		f.write(chain)
 
 	return cert
 
@@ -348,6 +333,8 @@ def read_last_pem_blob(data: bytes, name: str) -> Optional[bytes]:
 	for blob in read_pem_blobs(data):
 		if blob.name == name:
 			result = blob
+	if result is None:
+		return None
 	return result.data
 
 
