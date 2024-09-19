@@ -49,23 +49,29 @@ def parseArguments():
 	parser.add_argument('CA_DIR',                              help='Root directory for the CA files.')
 	parser.add_argument('--csr',          action='store_true', help='Create a CSR to be signed by the parent CA.')
 	parser.add_argument('--self-signed',  action='store_true', help='Create a self signed certificate, useful for a root CA.')
+	parser.add_argument('--reuse-key',    action='store_true', help='Re-use the existing CA key, useful for reneweing the certificate of a CA.')
 	parser.add_argument('--import-cert',                       help='Import an existing certificate as CA cert.')
 	parser.add_argument('--days',            type=int,         help='The validity period of the self signed certificate in days, starting today.')
 	parser.add_argument('--max-path-length', type=int,         help='The maximum path of intermediate CA\'s following the newly created one.')
 	return parser.parse_args()
 
 
-def create_csr(root: Path, dn: x509.Name, dns_name, max_path_length: Optional[int], now: datetime) -> int:
-	key_file = root / 'ca-key' / '{}-{:%Y-%m-%d-%H-%M-%S}.key.pem'.format(dns_name, now)
+def create_csr(
+	root: Path,
+	dn: x509.Name,
+	dns_name,
+	reuse_key: bool,
+	max_path_length: Optional[int],
+	now: datetime,
+) -> int:
 	key_link = root / 'ca.key.pem'
 
 	csr_file = root / 'ca-csr' / '{}-{:%Y-%m-%d-%H-%M-%S}.csr.pem'.format(dns_name, now)
 	csr_link = root / 'ca.csr.pem'
 
-	files        = [key_file, csr_file]
-	links        = [key_link, csr_link]
+	files        = [csr_file]
+	links        = [csr_link]
 	public_dirs  = [root / 'signed', csr_file.parent]
-	private_dirs = [key_file.parent]
 
 	# Make sure the files don't exist yet.
 	for file in files:
@@ -83,17 +89,23 @@ def create_csr(root: Path, dn: x509.Name, dns_name, max_path_length: Optional[in
 	for dir in public_dirs:
 		os.makedirs(dir, exist_ok=True)
 
-	# Create private directories with modified umask.
-	umask = util.or_umask(0o077)
-	for dir in private_dirs:
-		os.makedirs(dir, exist_ok=True)
-	os.umask(umask)
+	if reuse_key:
+		# Load existing private key.
+		key = cert_tools.load_key(key_link)
+	else:
+		key_file = root / 'ca-key' / '{}-{:%Y-%m-%d-%H-%M-%S}.key.pem'.format(dns_name, now)
+		msg('Generating key pair: {}', key_file)
 
-	# Generate key with modified umask.
-	msg('Generating key pair: {}', key_file)
-	umask = util.or_umask(0o277)
-	key = cert_tools.generate_rsa_key(key_file)
-	os.umask(umask)
+		# Create private directories with modified umask.
+		umask = util.or_umask(0o077)
+		os.makedirs(key_file.parent, exist_ok=True)
+
+		# Generate key with modified umask.
+		util.or_umask(0o277)
+		key = cert_tools.generate_rsa_key(key_file)
+		os.umask(umask)
+		files.append(key_file)
+		links.append(key_link)
 
 	# Create a CSR for the parent CA to sign.
 	msg('Making CSR: {}', csr_file)
@@ -111,15 +123,22 @@ def create_csr(root: Path, dn: x509.Name, dns_name, max_path_length: Optional[in
 	return 0
 
 
-def create_self_signed(root: Path, dn: x509.Name, dns_name: str, max_path_length: Optional[int], days: int, now: datetime) -> int:
-	key_file = root / 'ca-key' / '{}-{:%Y-%m-%d-%H-%M-%S}.key.pem'.format(dns_name, now)
+def create_self_signed(
+	root: Path,
+	dn: x509.Name,
+	dns_name: str,
+	reuse_key: bool,
+	max_path_length: Optional[int],
+	days: int,
+	now: datetime,
+) -> int:
 	key_link = root / 'ca.key.pem'
 
 	cert_file = root / 'ca-cert' / '{}-{:%Y-%m-%d-%H-%M-%S}.csr.pem'.format(dns_name, now)
 	cert_link = root / 'ca.cert.pem'
 
-	files        = [key_file, cert_file]
-	links        = [key_link, cert_link]
+	files        = [cert_file]
+	links        = [cert_link]
 	public_dirs  = [root / 'signed', cert_file.parent]
 	private_dirs = [key_file.parent]
 
@@ -139,17 +158,23 @@ def create_self_signed(root: Path, dn: x509.Name, dns_name: str, max_path_length
 	for dir in public_dirs:
 		os.makedirs(dir, exist_ok=True)
 
-	# Create private directories with modified umask.
-	umask = util.or_umask(0o077)
-	for dir in private_dirs:
-		os.makedirs(dir, exist_ok=True)
-	os.umask(umask)
+	if reuse_key:
+		# Load existing private key.
+		key = cert_tools.load_key(key_link)
+	else:
+		key_file = root / 'ca-key' / '{}-{:%Y-%m-%d-%H-%M-%S}.key.pem'.format(dns_name, now)
+		msg('Generating key pair: {}', key_file)
 
-	# Generate key with modified umask.
-	msg('Generating key pair: {}', key_file)
-	umask = util.or_umask(0o277)
-	key = cert_tools.generate_rsa_key(key_file)
-	os.umask(umask)
+		# Create private directories with modified umask.
+		umask = util.or_umask(0o077)
+		os.makedirs(key_file.parent, exist_ok=True)
+
+		# Generate key with modified umask.
+		util.or_umask(0o277)
+		key = cert_tools.generate_rsa_key(key_file)
+		os.umask(umask)
+		files.append(key_file)
+		links.append(key_link)
 
 	# Create and/or bump serial number.
 	serial = cert_tools.bump_serial(root / 'serial')
@@ -227,12 +252,12 @@ def main():
 		return 1
 
 	if args.csr:
-		return create_csr(root, dn, dns, args.max_path_length, now)
+		return create_csr(root, dn, dns, args.reuse_key, args.max_path_length, now)
 	elif args.self_signed:
 		if args.days is None:
 			error('The options --days is required when using --self-signed')
 			return 1
-		return create_self_signed(root, dn, dns, args.max_path_length, args.days, now)
+		return create_self_signed(root, dn, dns, args.reuse_key, args.max_path_length, args.days, now)
 	elif args.import_cert is not None:
 		return import_certificate(root, Path(args.import_cert))
 
